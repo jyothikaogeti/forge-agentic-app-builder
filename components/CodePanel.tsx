@@ -271,7 +271,7 @@ function SandpackContent({
         ? `${appTitle
             .toLowerCase()
             .replace(/[^a-z0-9]+/g, "-")
-            .replace(/^-|-$/g, "")}.zip}`
+            .replace(/^-|-$/g, "")}.zip`
         : "forge-agentic-app-builder.zip";
       a.click();
       URL.revokeObjectURL(url);
