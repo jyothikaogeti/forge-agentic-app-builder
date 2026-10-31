@@ -129,7 +129,7 @@ export default function WorkspaceClient({
 
   const handleGenerate = useCallback(
     async (prompt: string, imageUrl?: string, isRetry = false) => {
-      if (isGenerating) return;
+      if (isGenerating || isImproving) return;
 
       if (credits < MINIMUM_CREDITS_TO_GENERATE) {
         return;
@@ -418,7 +418,14 @@ export default function WorkspaceClient({
         setIsGenerating(false);
       }
     },
-    [userId, credits, isGenerating, pushStatusStep, completeStatusSteps],
+    [
+      userId,
+      credits,
+      isGenerating,
+      isImproving,
+      pushStatusStep,
+      completeStatusSteps,
+    ],
   );
 
   const handleRetryGenerate = useCallback(async () => {
@@ -437,17 +444,14 @@ export default function WorkspaceClient({
         return;
       }
 
+      const workspaceId = workspaceIdRef.current;
+
+      if (!workspaceId || !fileDataRef.current) {
+        return;
+      }
+
       if (credits < MINIMUM_CREDITS_TO_GENERATE) {
-        return;
-      }
-
-      if (!workspaceIdRef.current) {
-        return;
-      }
-
-      const currentFileData = fileDataRef.current;
-
-      if (!currentFileData) {
+        toast.error("Not enough credits");
         return;
       }
 
@@ -466,8 +470,14 @@ export default function WorkspaceClient({
       ]);
 
       const abortController = new AbortController();
-
       improveAbortRef.current = abortController;
+
+      let accumulatedThinking = "";
+      let completed = false;
+
+      const removeOptimisticMessages = () => {
+        setMessages((prev) => prev.slice(0, -2));
+      };
 
       try {
         const response = await fetch("/api/improve", {
@@ -476,41 +486,151 @@ export default function WorkspaceClient({
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            userId,
-            workspaceId: workspaceIdRef.current,
+            workspaceId,
             userRequest,
-            fileData: currentFileData,
           }),
           signal: abortController.signal,
         });
 
-        if (response.status === 403) {
-          toast.error("Upgrade to Starter or Pro to use Improve with AI.");
+        if (!response.ok) {
+          let errorMessage = `Improve failed (${response.status})`;
+          try {
+            const errorData: unknown = await response.json();
 
-          setMessages((prev) => prev.slice(0, -2));
+            if (typeof errorData === "object" && errorData !== null) {
+              const data = errorData as {
+                error?: unknown;
+                message?: unknown;
+              };
 
-          return;
+              if (typeof data.message === "string") {
+                errorMessage = data.message;
+              } else if (typeof data.error === "string") {
+                errorMessage = data.error;
+              }
+            }
+          } catch {
+            // Keep the fallback error message if the response isn't valid JSON.
+          }
+
+          if (response.status === 401) {
+            errorMessage = "Please sign in to continue.";
+          } else if (response.status === 402) {
+            errorMessage = "Not enough credits.";
+          } else if (response.status === 403) {
+            errorMessage = "Upgrade to Pro to use Improve with AI.";
+          } else if (response.status === 404) {
+            errorMessage = "Workspace not found.";
+          } else if (response.status === 503) {
+            errorMessage =
+              "AI service is currently unavailable. Please try again.";
+          }
+
+          throw new Error(errorMessage);
         }
 
-        if (response.status === 402) {
-          toast.error("Not enough credits.");
-
-          setMessages((prev) => prev.slice(0, -2));
-
-          return;
-        }
-
-        if (!response.ok || !response.body) {
-          throw new Error("Improve failed");
+        if (!response.body) {
+          throw new Error("The server returned an empty response");
         }
 
         const reader = response.body.getReader();
-
         const decoder = new TextDecoder();
 
         let buffer = "";
 
-        let accumulatedThinking = "";
+        const processEvent = (frame: string) => {
+          if (completed) return;
+
+          const data = frame
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trimStart())
+            .join("\n");
+
+          if (!data) return;
+
+          let event: unknown;
+
+          try {
+            event = JSON.parse(data);
+          } catch {
+            return;
+          }
+
+          if (typeof event !== "object" || event === null) {
+            return;
+          }
+
+          const parsed = event as {
+            type?: unknown;
+            text?: unknown;
+            fileData?: unknown;
+            creditsRemaining?: unknown;
+            summary?: unknown;
+            message?: unknown;
+          };
+
+          if (parsed.type === "thinking") {
+            if (typeof parsed.text !== "string") return;
+
+            accumulatedThinking += parsed.text;
+
+            setMessages((prev) => {
+              const updated = [...prev];
+              const lastIndex = updated.length - 1;
+
+              if (lastIndex >= 0 && updated[lastIndex].role === "assistant") {
+                updated[lastIndex] = {
+                  ...updated[lastIndex],
+                  content: accumulatedThinking,
+                };
+              }
+
+              return updated;
+            });
+          } else if (parsed.type === "done") {
+            if (
+              typeof parsed.summary !== "string" ||
+              !parsed.summary.trim() ||
+              typeof parsed.creditsRemaining !== "number" ||
+              typeof parsed.fileData !== "object" ||
+              parsed.fileData === null
+            ) {
+              throw new Error(
+                "The server returned an invalid completion response.",
+              );
+            }
+
+            const updatedFileData = parsed.fileData as FileData;
+
+            completed = true;
+
+            fileDataRef.current = updatedFileData;
+            setFileData(updatedFileData);
+
+            setCredits(parsed.creditsRemaining);
+
+            setMessages((prev) => {
+              const updated = [...prev];
+              const lastIndex = updated.length - 1;
+
+              if (lastIndex >= 0 && updated[lastIndex].role === "assistant") {
+                updated[lastIndex] = {
+                  ...updated[lastIndex],
+                  content: parsed.summary as string,
+                };
+              }
+
+              return updated;
+            });
+          } else if (parsed.type === "error") {
+            throw new Error(
+              typeof parsed.message === "string"
+                ? parsed.message
+                : "Unable to complete improvements.",
+            );
+          }
+        };
 
         while (true) {
           const { done, value } = await reader.read();
@@ -523,71 +643,48 @@ export default function WorkspaceClient({
             stream: true,
           });
 
-          const lines = buffer.split("\n\n");
+          const frames = buffer.split(/\r?\n\r?\n/);
+          buffer = frames.pop() ?? "";
 
-          buffer = lines.pop() ?? "";
-
-          for (const line of lines) {
-            if (!line.startsWith("data: ")) {
-              continue;
-            }
-
-            let event: any;
-
-            try {
-              event = JSON.parse(line.slice(6));
-            } catch {
-              continue;
-            }
-
-            if (event.type === "thinking") {
-              accumulatedThinking += event.text;
-
-              setMessages((prev) => {
-                const updatedMessages = [...prev];
-
-                updatedMessages[updatedMessages.length - 1] = {
-                  role: "assistant",
-                  content: accumulatedThinking,
-                };
-
-                return updatedMessages;
-              });
-            } else if (event.type === "done") {
-              setFileData(event.fileData);
-
-              setCredits(event.creditsRemaining);
-
-              setMessages((prev) => {
-                const updatedMessages = [...prev];
-
-                updatedMessages[updatedMessages.length - 1] = {
-                  role: "assistant",
-                  content: event.summary,
-                };
-
-                return updatedMessages;
-              });
-            } else if (event.type === "error") {
-              throw new Error(event.message ?? "Improve failed.");
-            }
+          for (const frame of frames) {
+            processEvent(frame);
           }
+        }
+
+        buffer += decoder.decode();
+
+        if (buffer.trim()) {
+          processEvent(buffer);
+        }
+
+        if (!completed) {
+          throw new Error(
+            "The connection ended before Improve finished. Please try again.",
+          );
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
+          if (!completed) {
+            removeOptimisticMessages();
+          }
           return;
         }
 
-        toast.error(error instanceof Error ? error.message : "Improve failed.");
+        if (!completed) {
+          removeOptimisticMessages();
+        }
 
-        setMessages((prev) => prev.slice(0, -2));
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : "Unable to complete improvements.",
+        );
       } finally {
         improveAbortRef.current = null;
-
         setIsImproving(false);
       }
     },
-    [userId, credits, isGenerating, isImproving],
+    [credits, isGenerating, isImproving],
   );
 
   const handleStop = useCallback(() => {
