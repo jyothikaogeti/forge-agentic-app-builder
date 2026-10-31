@@ -651,7 +651,25 @@ export async function POST(request: NextRequest) {
     return Response.json({ message: "Unauthorized" }, { status: 401 });
   }
 
-  const body = await request.json();
+  let body: unknown;
+
+  try {
+    body = await request.json();
+  } catch {
+    console.log("[GEN-AI] ❌ Invalid JSON in request body");
+
+    return Response.json(
+      { message: "Invalid JSON in request body" },
+      { status: 400 },
+    );
+  }
+
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return Response.json(
+      { message: "Request body must be an JSON object" },
+      { status: 400 },
+    );
+  }
 
   const { workspaceId, messages, fileData } = body as {
     workspaceId: string | null;
